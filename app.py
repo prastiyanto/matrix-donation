@@ -14,19 +14,40 @@ st.set_page_config(page_title="Keanggotaan Matrix Donation", layout="wide")
 @st.cache_resource
 def init_connection():
     """
-    Menginisialisasi koneksi ke Google Sheets menggunakan credentials.json.
-    Mengembalikan objek worksheet atau None jika gagal.
+    Menginisialisasi koneksi ke Google Sheets menggunakan hybrid logic:
+    1. Cek `st.secrets` (Streamlit Cloud).
+    2. Cek `credentials.json` (Local).
     """
-    if not os.path.exists("credentials.json"):
-        st.error("⚠️ File 'credentials.json' tidak ditemukan di direktori project!")
-        return None
-
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    
     try:
-        # Autentikasi dengan service account
-        gc = gspread.service_account(filename="credentials.json")
-        # Buka Spreadsheet berdasarkan nama
+        # 1. Cek Streamlit Secrets (Cloud)
+        if "gcp_service_account" in st.secrets:
+            # Baca secrets menjadi dictionary
+            service_account_info = json.loads(st.secrets["gcp_service_account"])
+            creds = Credentials.from_service_account_info(
+                service_account_info, scopes=scopes
+            )
+            gc = gspread.authorize(creds)
+            
+        # 2. Cek File Credentials Local
+        elif os.path.exists("credentials.json"):
+            creds = Credentials.from_service_account_file(
+                "credentials.json", scopes=scopes
+            )
+            gc = gspread.authorize(creds)
+            
+        else:
+            st.error("⚠️ Tidak ditemukan kredensial (secrets atau credentials.json)!")
+            return None
+
+        # Buka Spreadsheet
         sh = gc.open("DB_MD")
         return sh
+        
     except Exception as e:
         st.error(f"❌ Gagal terhubung ke Google Sheets: {e}")
         return None
