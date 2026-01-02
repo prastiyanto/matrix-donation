@@ -19,6 +19,9 @@ def init_connection():
     Menginisialisasi koneksi ke Google Sheets menggunakan hybrid logic:
     1. Cek `st.secrets` (Streamlit Cloud).
     2. Cek `credentials.json` (Local).
+    Menangani dua format untuk st.secrets["gcp_service_account"]:
+    - dict (direkomendasikan, mis. simpan sebagai TOML table di secrets)
+    - string JSON (bisa mengandung newline tak ter-escape; coba perbaiki)
     """
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -28,22 +31,44 @@ def init_connection():
     try:
         # 1. Cek Streamlit Secrets (Cloud)
         if "gcp_service_account" in st.secrets:
-            # Baca secrets menjadi dictionary
-            service_account_info = json.loads(st.secrets["gcp_service_account"])
-            creds = Credentials.from_service_account_info(
-                service_account_info, scopes=scopes
-            )
+            service_account_secret = st.secrets["gcp_service_account"]
+            service_account_info = None
+
+            # Jika sudah dict (direkomendasikan), gunakan langsung
+            if isinstance(service_account_secret, dict):
+                service_account_info = service_account_secret
+
+            # Jika string, coba parse JSON. Tangani newline tak ter-escape.
+            elif isinstance(service_account_secret, str):
+                try:
+                    service_account_info = json.loads(service_account_secret)
+                except json.JSONDecodeError as e:
+                    # Coba perbaiki kasus umum: JSON multi-line disimpan tanpa escape
+                    try:
+                        fixed = service_account_secret.replace('\r\n', '\\n').replace('\n', '\\n')
+                        service_account_info = json.loads(fixed)
+                    except Exception:
+                        st.error("❌ GCP service account di st.secrets tidak dapat di-parse sebagai JSON.")
+                        st.error("   - Pastikan Anda menyimpan service account sebagai TOML table di .streamlit/secrets.toml atau\n"
+                                 "   - jika menyimpan sebagai string JSON, gunakan JSON satu baris dengan newline yang telah di-escape (\\n).")
+                        return None
+            else:
+                st.error("❌ Format st.secrets['gcp_service_account'] tidak dikenali. Harus dict atau string JSON.")
+                return None
+
+            creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
             gc = gspread.authorize(creds)
-            
+
         # 2. Cek File Credentials Local
         elif os.path.exists("credentials.json"):
-            creds = Credentials.from_service_account_file(
-                "credentials.json", scopes=scopes
-            )
+            creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
             gc = gspread.authorize(creds)
             
         else:
             st.error("⚠️ Tidak ditemukan kredensial (secrets atau credentials.json)!")
+            st.info("Cara yang disarankan:\n"
+                    "- Di Streamlit Cloud: simpan service account sebagai TOML table di .streamlit/secrets.toml\n"
+                    "- Lokal: taruh file credentials.json di folder proyek.")
             return None
 
         # Buka Spreadsheet
@@ -88,7 +113,10 @@ if menu == "Pendaftaran Anggota":
                     try:
                         # 2. Persiapan Data
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        #pwd_hash = hash_password(password)
+                        # NOTE: saat ini password disimpan apa adanya (ikuti struktur sheet Anda).
+                        # Jika ingin menyimpan hash, uncomment baris berikut:
+                        # pwd_hash = hash_password(password)
+                        # row_data = [nama, username, email, pwd_hash, no_wa, link_profil, timestamp]
                         
                         # [Nama, Username, Email, Password, No_WA, Link, Timestamp]
                         row_data = [nama, username, email, password, no_wa, link_profil, timestamp]
@@ -129,10 +157,12 @@ elif menu == "Login Admin":
                     df = pd.DataFrame(data)
                     df.index = df.index + 1  # Mulai index dari 1
                     
-                    # Privacy Rule: Hapus kolom password hash jika ada
+                    # Privacy Rule: Hapus kolom password jika ada
                     df_display = df.copy()
-                    if 'Password_Hash' in df_display.columns:
-                        df_display = df_display.drop(columns=['Password_Hash'])
+                    # Hapus kolom yang kemungkinan berisi password
+                    for col in ("Password_Hash", "Password"):
+                        if col in df_display.columns:
+                            df_display = df_display.drop(columns=[col])
                     
                     st.dataframe(df_display, use_container_width=True)
                     st.info(f"Total Database: {len(df)} Anggota")
@@ -147,7 +177,12 @@ elif menu == "Login Admin":
                         st.subheader("Edit Data Anggota")
                         
                         # Pilih User untuk diedit
-                        user_options = [f"{row['Username']} - {row['Nama']}" for index, row in df.iterrows()]
+                        user_options = []
+                        if 'Username' in df.columns and 'Nama' in df.columns:
+                            user_options = [f"{row['Username']} - {row['Nama']}" for index, row in df.iterrows()]
+                        else:
+                            st.warning("Format header sheet tidak seperti yang diharapkan (harus ada kolom 'Username' dan 'Nama').")
+                        
                         selected_user_str = st.selectbox("Pilih Anggota untuk Diedit", options=user_options, index=None, placeholder="Cari Username/Nama...")
                         
                         if selected_user_str:
@@ -165,8 +200,8 @@ elif menu == "Login Admin":
                                 new_username_input = st.text_input("Username", value=selected_row['Username'])
                                 new_email = st.text_input("Email", value=selected_row['Email'])
                                 new_password_input = st.text_input("Password Baru (Biarkan kosong jika tidak diganti)", type="password")
-                                new_no_wa = st.text_input("No WhatsApp", value=selected_row['No_WA'])
-                                new_link = st.text_input("Link Profil", value=selected_row['Link'])
+                                new_no_wa = st.text_input("No WhatsApp", value=selected_row.get('No_WA', ''))
+                                new_link = st.text_input("Link Profil", value=selected_row.get('Link', ''))
                                 
                                 btn_update = st.form_submit_button("Simpan Perubahan")
                                 
@@ -175,19 +210,22 @@ elif menu == "Login Admin":
                                         cell_username = worksheet.find(selected_username)
                                         row_number = cell_username.row
                                         
-                                        worksheet.update_cell(row_number, 2, new_nama)
-                                        worksheet.update_cell(row_number, 3, new_username_input)
-                                        worksheet.update_cell(row_number, 4, new_email)
+                                        # Update sesuai urutan kolom yang dipakai di sheet Anda. 
+                                        # Perhatikan: index kolom mungkin berbeda jika header berbeda.
+                                        worksheet.update_cell(row_number, 1, new_nama)
+                                        worksheet.update_cell(row_number, 2, new_username_input)
+                                        worksheet.update_cell(row_number, 3, new_email)
                                         
                                         if new_password_input:
                                             new_hash = hash_password(new_password_input)
-                                            worksheet.update_cell(row_number, 5, new_hash)
+                                            # Jika Anda ingin menyimpan hash, tulis ke kolom password:
+                                            worksheet.update_cell(row_number, 4, new_hash)
                                             
-                                        worksheet.update_cell(row_number, 6, new_no_wa)
-                                        worksheet.update_cell(row_number, 7, new_link)
+                                        worksheet.update_cell(row_number, 5, new_no_wa)
+                                        worksheet.update_cell(row_number, 6, new_link)
                                         
                                         st.success(f"Data {new_username_input} berhasil diperbarui!")
-                                        st.rerun()
+                                        st.experimental_rerun()
                                         
                                     except gspread.exceptions.CellNotFound:
                                         st.error("Error: Data tidak ditemukan di Spreadsheet. Silakan refresh.")
@@ -212,7 +250,7 @@ elif menu == "Login Admin":
                                     worksheet.delete_rows(row_number)
                                     
                                     st.success(f"Anggota {delete_username} telah dihapus.")
-                                    st.rerun()
+                                    st.experimental_rerun()
                                     
                                 except gspread.exceptions.CellNotFound:
                                     st.error("Error: User tidak ditemukan. Coba refresh halaman.")
@@ -252,7 +290,7 @@ elif menu == "Login Admin":
                                         image = Image.open("template_kartu.png")
                                         draw = ImageDraw.Draw(image)
                                         
-                                        # Load Font (Default jika arial tidak ada)
+                                        # Load Font (Default jika roboto tidak ada)
                                         try:
                                             font = ImageFont.truetype("roboto.ttf", 70)
                                         except IOError:
@@ -261,13 +299,13 @@ elif menu == "Login Admin":
                                         # Warna Teks
                                         text_color = "#1A0B2E"
                                         
-                                        # Draw Data
-                                        draw.text(POSISI_TEKS["nama"], f"{card_data['Nama']}", fill=text_color, font=font)
-                                        draw.text(POSISI_TEKS["username"], f"{card_data['Username']}", fill=text_color, font=font)
-                                        draw.text(POSISI_TEKS["email"], f"{card_data['Email']}", fill=text_color, font=font)
-                                        draw.text(POSISI_TEKS["password"], f"{card_data['Password']}", fill=text_color, font=font)
-                                        draw.text(POSISI_TEKS["wa"], f"{card_data['No_WA']}", fill=text_color, font=font)
-                                        draw.text(POSISI_TEKS["link"], f"{card_data['Link']}", fill=text_color, font=font)
+                                        # Draw Data (gunakan .get untuk menghindari KeyError)
+                                        draw.text(POSISI_TEKS["nama"], f"{card_data.get('Nama','')}", fill=text_color, font=font)
+                                        draw.text(POSISI_TEKS["username"], f"{card_data.get('Username','')}", fill=text_color, font=font)
+                                        draw.text(POSISI_TEKS["email"], f"{card_data.get('Email','')}", fill=text_color, font=font)
+                                        draw.text(POSISI_TEKS["password"], f"{card_data.get('Password','')}", fill=text_color, font=font)
+                                        draw.text(POSISI_TEKS["wa"], f"{card_data.get('No_WA','')}", fill=text_color, font=font)
+                                        draw.text(POSISI_TEKS["link"], f"{card_data.get('Link','')}", fill=text_color, font=font)
                                         
                                         # Tampilkan Preview
                                         st.image(image, caption="Preview Kartu Anggota", use_container_width=True)
