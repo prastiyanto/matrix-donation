@@ -1,5 +1,0 @@
-streamlit
-gspread
-pandas
-google-auth
-Pillow
